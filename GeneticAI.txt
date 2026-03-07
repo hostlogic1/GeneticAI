@@ -1,0 +1,6 @@
+AI Creates New Trading Indicators with Genetic Programming
+
+
+GitHub Repo
+
+https://github.com/ZiadFrancis/Genetics_Trading_Part_1.git 

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.dill
+*.zip
+*.log
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+streamlit.log
+evolution_results.dill
+Genetics_Trading_Part_1-main/
