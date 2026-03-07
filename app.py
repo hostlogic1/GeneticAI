@@ -364,7 +364,18 @@ with st.sidebar:
     if data_source == "Yahoo Finance":
         symbol = st.text_input("Symbol", value="SOL-USD")
         interval = st.selectbox("Timeframe", ["1h", "1d", "15m", "30m", "5m"], index=0)
-        period = st.selectbox("Period", ["2y", "1y", "6mo", "3mo", "5y"], index=0)
+
+        # Show valid periods based on interval
+        interval_periods = {
+            "1h": ["2y", "1y", "6mo", "3mo"],
+            "1d": ["5y", "2y", "1y", "6mo", "3mo"],
+            "15m": ["1mo", "7d"],
+            "30m": ["1mo", "7d"],
+            "5m": ["1mo", "7d"],
+        }
+        valid_periods = interval_periods.get(interval, ["2y", "1y", "6mo"])
+        period = st.selectbox("Period", valid_periods, index=0)
+        st.caption(f"Max for {interval}: {valid_periods[0]}")
     else:
         csv_file = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -402,12 +413,15 @@ with st.sidebar:
                     else:
                         st.error("Please upload a CSV file")
 
-                if st.session_state.data is not None:
+                if st.session_state.data is not None and len(st.session_state.data) > 0:
                     train, val, test = split_data(st.session_state.data, train_pct, val_pct)
                     st.session_state.train = train
                     st.session_state.val = val
                     st.session_state.test = test
-                    st.success(f"Loaded {len(st.session_state.data)} bars")
+                    st.session_state.results = None  # Clear old results on new data
+                    st.success(f"Loaded {len(st.session_state.data):,} bars | Train: {len(train):,} | Val: {len(val):,} | Test: {len(test):,}")
+            except ValueError as e:
+                st.error(str(e))
             except Exception as e:
                 st.error(f"Error loading data: {e}")
 

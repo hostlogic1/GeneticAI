@@ -868,13 +868,45 @@ def run_evolution(
 # ---------------------------------------------------------------------------
 # 10. Data Loading Utilities
 # ---------------------------------------------------------------------------
+YFINANCE_LIMITS = {
+    "1m": "7d", "2m": "60d", "5m": "60d", "15m": "60d", "30m": "60d",
+    "1h": "2y", "1d": "10y", "1wk": "10y", "1mo": "10y",
+}
+
 def load_data_yfinance(symbol: str = "SOL-USD", interval: str = "1h",
                        period: str = "2y") -> pd.DataFrame:
     import yfinance as yf
+
+    # Clamp period to yfinance max for this interval
+    max_period = YFINANCE_LIMITS.get(interval, "2y")
+    period_order = ["7d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y"]
+    if period in period_order and max_period in period_order:
+        if period_order.index(period) > period_order.index(max_period):
+            print(f"Warning: {interval} data only supports up to {max_period}. Clamping period.")
+            period = max_period
+
     print(f"Downloading {symbol} {interval} data ({period})...")
     ticker = yf.Ticker(symbol)
     df = ticker.history(period=period, interval=interval)
-    df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+
+    if df is None or df.empty:
+        raise ValueError(
+            f"No data returned for {symbol} ({interval}, {period}). "
+            f"Check the symbol or try a different interval/period. "
+            f"Max period for {interval} is {max_period}."
+        )
+
+    available = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    if len(available) < 4:
+        raise ValueError(f"Missing OHLC columns. Got: {list(df.columns)}")
+
+    df = df[available].dropna()
+    if len(df) < 50:
+        raise ValueError(
+            f"Only {len(df)} bars returned for {symbol} ({interval}, {period}). "
+            f"Need at least 50. Try a longer period or different interval."
+        )
+
     print(f"Loaded {len(df)} bars from {df.index[0]} to {df.index[-1]}")
     return df
 
