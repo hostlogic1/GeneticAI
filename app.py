@@ -3,6 +3,8 @@ GeneticAI Elite Dashboard
 =========================
 Streamlit dashboard for running and viewing genetic indicator optimization results.
 Dark-themed, inspired by the Wolfpack Elite Dashboard design.
+Features: Walk-forward analysis, configurable strategy complexity,
+favorites system with strategy export.
 """
 
 import streamlit as st
@@ -13,6 +15,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import time
 import json
+import datetime
 from pathlib import Path
 
 from genetic_indicator_engine import (
@@ -20,6 +23,8 @@ from genetic_indicator_engine import (
     load_data_yfinance, load_data_csv, split_data,
     IndicatorCache, INDICATOR_NAMES, INDICATOR_REGISTRY,
     save_results, load_results, TradingStrategy, compute_fitness_score,
+    run_walk_forward, generate_walk_forward_folds,
+    save_favorites, load_favorites, strategy_from_dict, export_strategy_script,
 )
 
 # ---------------------------------------------------------------------------
@@ -114,9 +119,25 @@ st.markdown("""
         font-size: 0.85em;
     }
 
-    /* Validated badge */
-    .badge-validated {
+    /* Validated badges */
+    .badge-strong {
         background: #00e676;
+        color: #000;
+        padding: 8px 20px;
+        border-radius: 5px;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .badge-validated {
+        background: #00bcd4;
+        color: #000;
+        padding: 8px 20px;
+        border-radius: 5px;
+        font-weight: bold;
+        display: inline-block;
+    }
+    .badge-weak {
+        background: #ffc107;
         color: #000;
         padding: 8px 20px;
         border-radius: 5px;
@@ -202,16 +223,11 @@ def create_equity_chart(equity_curve, title="Equity Curve"):
         paper_bgcolor='#0a0e17',
         plot_bgcolor='#0a0e17',
         font=dict(color='#8892a4'),
-        xaxis=dict(
-            gridcolor='#1a2744',
-            title='Timestamp',
-        ),
-        yaxis=dict(
-            gridcolor='#1a2744',
-            title='Equity ($)',
-        ),
+        xaxis=dict(gridcolor='#1a2744', title=''),
+        yaxis=dict(gridcolor='#1a2744', title='Equity ($)'),
         hovermode='x unified',
         margin=dict(l=60, r=20, t=40, b=40),
+        height=400,
     )
     return fig
 
@@ -230,7 +246,7 @@ def create_drawdown_chart(portfolio):
         name='Drawdown %',
     ))
     fig.update_layout(
-        title=dict(text='Drawdown', font=dict(color='#e0e0e0', size=16)),
+        title=dict(text='Drawdown', font=dict(color='#e0e0e0', size=14)),
         paper_bgcolor='#0a0e17',
         plot_bgcolor='#0a0e17',
         font=dict(color='#8892a4'),
@@ -238,6 +254,7 @@ def create_drawdown_chart(portfolio):
         yaxis=dict(gridcolor='#1a2744', title='Drawdown %'),
         hovermode='x unified',
         margin=dict(l=60, r=20, t=40, b=40),
+        height=250,
     )
     return fig
 
@@ -303,6 +320,91 @@ def create_bootstrap_chart(bootstrap_results):
     return fig
 
 
+def create_trade_distribution_chart(trades_df):
+    """Create a trade PnL distribution histogram."""
+    if trades_df is None or trades_df.empty:
+        return None
+    pnl_col = None
+    for col in ["PnL", "Return", "pnl", "return"]:
+        if col in trades_df.columns:
+            pnl_col = col
+            break
+    if pnl_col is None:
+        return None
+
+    fig = go.Figure()
+    values = trades_df[pnl_col].dropna()
+    colors = ['#00e676' if v > 0 else '#ff5252' for v in values]
+    fig.add_trace(go.Histogram(
+        x=values,
+        nbinsx=30,
+        marker_color='#00bcd4',
+        opacity=0.7,
+        name='Trade PnL',
+    ))
+    fig.add_vline(x=0, line_dash="dash", line_color="#ffc107", line_width=2)
+    fig.update_layout(
+        title=dict(text='Trade PnL Distribution', font=dict(color='#e0e0e0', size=14)),
+        paper_bgcolor='#0a0e17',
+        plot_bgcolor='#0a0e17',
+        font=dict(color='#8892a4'),
+        xaxis=dict(gridcolor='#1a2744', title='PnL'),
+        yaxis=dict(gridcolor='#1a2744', title='Frequency'),
+        margin=dict(l=60, r=20, t=40, b=40),
+        height=300,
+    )
+    return fig
+
+
+def create_walk_forward_fold_chart(fold_results, train_months, test_months):
+    """Create horizontal bar chart showing train/test windows per fold (like the reference screenshots)."""
+    fig = go.Figure()
+
+    for fold in reversed(fold_results):
+        fold_label = f"Fold {fold['fold_num']}"
+        train_start = pd.Timestamp(fold["train_start"])
+        train_end = pd.Timestamp(fold["train_end"])
+        test_start = pd.Timestamp(fold["test_start"])
+        test_end = pd.Timestamp(fold["test_end"])
+
+        # Train bar
+        fig.add_trace(go.Bar(
+            y=[fold_label],
+            x=[(train_end - train_start).days],
+            base=[(train_start - pd.Timestamp(fold_results[0]["train_start"])).days],
+            orientation='h',
+            marker_color='#1e88e5',
+            name=f'Train ({train_months}mo)' if fold["fold_num"] == 1 else None,
+            showlegend=(fold["fold_num"] == 1),
+            hovertemplate=f'Train: {train_start.strftime("%Y-%m-%d")} to {train_end.strftime("%Y-%m-%d")}<extra></extra>',
+        ))
+        # Test bar
+        fig.add_trace(go.Bar(
+            y=[fold_label],
+            x=[(test_end - test_start).days],
+            base=[(test_start - pd.Timestamp(fold_results[0]["train_start"])).days],
+            orientation='h',
+            marker_color='#ff9800',
+            name=f'Blind Test ({test_months}mo)' if fold["fold_num"] == 1 else None,
+            showlegend=(fold["fold_num"] == 1),
+            hovertemplate=f'Test: {test_start.strftime("%Y-%m-%d")} to {test_end.strftime("%Y-%m-%d")}<extra></extra>',
+        ))
+
+    fig.update_layout(
+        title=dict(text='Walk-Forward Fold Windows', font=dict(color='#e0e0e0', size=16)),
+        paper_bgcolor='#0a0e17',
+        plot_bgcolor='#0a0e17',
+        font=dict(color='#8892a4'),
+        xaxis=dict(gridcolor='#1a2744', title='Days from start'),
+        yaxis=dict(gridcolor='#1a2744'),
+        barmode='overlay',
+        margin=dict(l=80, r=20, t=40, b=40),
+        height=max(250, len(fold_results) * 40 + 100),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
 def strategy_description(strat: TradingStrategy) -> str:
     """Human-readable strategy description."""
     lines = []
@@ -333,6 +435,24 @@ def strategy_description(strat: TradingStrategy) -> str:
     return "\n".join(lines)
 
 
+def get_validation_badge(metrics):
+    """Get tiered validation badge based on metrics."""
+    sharpe = metrics["sharpe"]
+    pf = metrics["profit_factor"]
+    wr = metrics["win_rate"]
+    ret = metrics["total_return"]
+    trades = metrics["total_trades"]
+
+    if sharpe > 1.0 and pf > 1.5 and wr > 55 and ret > 0 and trades > 15:
+        return "badge-strong", "STRONG"
+    elif sharpe > 0.3 and pf > 1.0 and ret > 0 and trades > 10:
+        return "badge-validated", "VALIDATED"
+    elif sharpe > 0 and ret > 0 and trades > 5:
+        return "badge-weak", "WEAK"
+    else:
+        return "badge-failed", "NOT VALIDATED"
+
+
 # ---------------------------------------------------------------------------
 # Session State Initialization
 # ---------------------------------------------------------------------------
@@ -348,8 +468,14 @@ if "test" not in st.session_state:
     st.session_state.test = None
 if "running" not in st.session_state:
     st.session_state.running = False
+if "running_wf" not in st.session_state:
+    st.session_state.running_wf = False
 if "selected_strategy_idx" not in st.session_state:
     st.session_state.selected_strategy_idx = 0
+if "wf_results" not in st.session_state:
+    st.session_state.wf_results = None
+if "favorites" not in st.session_state:
+    st.session_state.favorites = load_favorites()
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +521,28 @@ with st.sidebar:
     elite_size = st.slider("Elite Size", 1, 20, 5)
 
     st.markdown("---")
+    st.markdown("**Strategy Complexity**")
+    sc_col1, sc_col2 = st.columns(2)
+    min_entry = sc_col1.slider("Min Entry Conds", 1, 4, 2)
+    max_entry = sc_col2.slider("Max Entry Conds", 2, 6, 4)
+    sc_col3, sc_col4 = st.columns(2)
+    min_exit = sc_col3.slider("Min Exit Conds", 1, 2, 1)
+    max_exit = sc_col4.slider("Max Exit Conds", 1, 3, 2)
+    # Enforce min <= max
+    max_entry = max(max_entry, min_entry)
+    max_exit = max(max_exit, min_exit)
+
+    st.markdown("---")
+    st.markdown("**Walk-Forward Analysis**")
+    wf_enabled = st.checkbox("Enable Walk-Forward", value=False)
+    if wf_enabled:
+        wf_train_months = st.slider("Training Window (months)", 6, 24, 12)
+        wf_test_months = st.slider("Test Window (months)", 1, 6, 3)
+        wf_gens = st.slider("Generations per fold", 5, 50, 15)
+        wf_pop = st.slider("Population per fold", 20, 200, 50, step=10)
+        st.caption("Reduced pop/gens per fold for speed. Walk-forward runs the GA multiple times.")
+
+    st.markdown("---")
     bootstrap_samples = st.slider("Bootstrap Samples", 10, 200, 50)
     bootstrap_threshold = st.number_input("Bootstrap Threshold (%)", value=0.0)
 
@@ -418,7 +566,8 @@ with st.sidebar:
                     st.session_state.train = train
                     st.session_state.val = val
                     st.session_state.test = test
-                    st.session_state.results = None  # Clear old results on new data
+                    st.session_state.results = None
+                    st.session_state.wf_results = None
                     st.success(f"Loaded {len(st.session_state.data):,} bars | Train: {len(train):,} | Val: {len(val):,} | Test: {len(test):,}")
             except ValueError as e:
                 st.error(str(e))
@@ -443,12 +592,14 @@ st.markdown('<div class="dashboard-title">GeneticAI Elite Dashboard</div>', unsa
 
 if st.session_state.data is not None:
     data = st.session_state.data
+    sym_display = symbol if data_source == "Yahoo Finance" else "CSV"
+    int_display = interval if data_source == "Yahoo Finance" else "auto"
     info_text = (
-        f"SYMBOL: {data_source == 'Yahoo Finance' and symbol or 'CSV'} | "
-        f"TIMEFRAME: {data_source == 'Yahoo Finance' and interval or 'auto'} | "
+        f"SYMBOL: {sym_display} | "
+        f"TIMEFRAME: {int_display} | "
         f"BARS: {len(data):,} | "
         f"SPLIT: {train_pct*100:.0f}% IS / {val_pct*100:.0f}% OOS | "
-        f"THRESHOLD: {bootstrap_threshold}%"
+        f"ENTRY: {min_entry}-{max_entry} | EXIT: {min_exit}-{max_exit}"
     )
     st.markdown(f'<div class="dashboard-subtitle">{info_text}</div>', unsafe_allow_html=True)
 else:
@@ -460,8 +611,12 @@ col1, col2, col3 = st.columns([2, 2, 2])
 
 with col1:
     if st.session_state.data is not None:
-        if st.button("RUN EVOLUTION", use_container_width=True, type="primary"):
-            st.session_state.running = True
+        if wf_enabled:
+            if st.button("RUN WALK-FORWARD", use_container_width=True, type="primary"):
+                st.session_state.running_wf = True
+        else:
+            if st.button("RUN EVOLUTION", use_container_width=True, type="primary"):
+                st.session_state.running = True
 
 with col2:
     analysis_mode = st.selectbox("Analysis Mode", [
@@ -476,7 +631,7 @@ with col3:
 
 
 # ---------------------------------------------------------------------------
-# Run Evolution
+# Run Evolution (standard mode)
 # ---------------------------------------------------------------------------
 if st.session_state.running and st.session_state.train is not None:
     st.markdown('<div class="section-header">Evolution Progress</div>', unsafe_allow_html=True)
@@ -512,12 +667,57 @@ if st.session_state.running and st.session_state.train is not None:
         tournament_size=tournament_size,
         elite_size=elite_size,
         progress_callback=progress_callback,
+        min_entry=min_entry,
+        max_entry=max_entry,
+        min_exit=min_exit,
+        max_exit=max_exit,
     )
 
     st.session_state.results = results
     st.session_state.running = False
     save_results(results)
     st.success("Evolution complete! Results saved.")
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Run Walk-Forward
+# ---------------------------------------------------------------------------
+if st.session_state.running_wf and st.session_state.data is not None:
+    st.markdown('<div class="section-header">Walk-Forward Analysis Progress</div>', unsafe_allow_html=True)
+
+    progress_bar_wf = st.progress(0)
+    status_text_wf = st.empty()
+
+    def wf_progress_callback(fold_num, total_folds, fold_result):
+        progress_bar_wf.progress(fold_num / total_folds)
+        status_text_wf.markdown(
+            f"**Fold {fold_num}/{total_folds}** | "
+            f"OOS Return: {fold_result['oos_return']:+.2f}% | "
+            f"OOS Sharpe: {fold_result['oos_sharpe']:.3f} | "
+            f"Time: {fold_result['fold_time']:.1f}s"
+        )
+
+    wf_results = run_walk_forward(
+        df=st.session_state.data,
+        train_months=wf_train_months,
+        test_months=wf_test_months,
+        pop_size=wf_pop,
+        n_generations=wf_gens,
+        p_crossover=p_crossover,
+        p_mutation=p_mutation,
+        tournament_size=tournament_size,
+        elite_size=elite_size,
+        min_entry=min_entry,
+        max_entry=max_entry,
+        min_exit=min_exit,
+        max_exit=max_exit,
+        progress_callback=wf_progress_callback,
+    )
+
+    st.session_state.wf_results = wf_results
+    st.session_state.running_wf = False
+    st.success(f"Walk-forward complete! {wf_results['n_folds']} folds in {wf_results['total_time']:.1f}s")
     st.rerun()
 
 
@@ -559,79 +759,66 @@ if st.session_state.results is not None:
         # ---------------------------------------------------------------
         # Parameters section
         # ---------------------------------------------------------------
-        st.markdown('<div class="section-header">Parameters</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-header">Run Summary</div>', unsafe_allow_html=True)
 
         pcol1, pcol2, pcol3, pcol4 = st.columns(4)
         n_combos = len(strategies)
         n_survivors = sum(1 for s in strategies if s.fitness_trades > 10)
 
         with pcol1:
-            st.markdown(metric_card("Combos", f"{n_combos}", "neutral"), unsafe_allow_html=True)
+            st.markdown(metric_card("Population", f"{pop_size}", "neutral"), unsafe_allow_html=True)
         with pcol2:
-            st.markdown(metric_card("IS Survivors", f"{n_survivors}", "neutral"), unsafe_allow_html=True)
+            st.markdown(metric_card("Generations", f"{len(gen_stats)}", "neutral"), unsafe_allow_html=True)
         with pcol3:
-            bs_result = None
-            if analysis_mode == "Bootstrap":
-                bs_result = bootstrap_validation(
-                    current_strat, st.session_state.data,
-                    n_samples=bootstrap_samples,
-                    threshold=bootstrap_threshold,
-                )
-                st.markdown(metric_card("Bootstrap", f"{len(strategies)}", "neutral"), unsafe_allow_html=True)
-            else:
-                st.markdown(metric_card("Generations", f"{len(gen_stats)}", "neutral"), unsafe_allow_html=True)
+            total_evals = len(results.get("all_evaluated", []))
+            st.markdown(metric_card("Evaluations", f"{total_evals:,}", "neutral"), unsafe_allow_html=True)
         with pcol4:
-            st.markdown(metric_card("Final", f"{n_survivors}", "neutral"), unsafe_allow_html=True)
+            best_score = strategies_sorted[0].fitness_score if strategies_sorted else 0
+            st.markdown(metric_card("Best Score", f"{best_score:.2f}",
+                                     "positive" if best_score > 5 else "neutral"), unsafe_allow_html=True)
 
         # ---------------------------------------------------------------
-        # Key metrics row
+        # Key metrics row - 8 columns for all important metrics
         # ---------------------------------------------------------------
         st.markdown(f'<div class="section-header">{eval_label}</div>', unsafe_allow_html=True)
 
-        mcol1, mcol2, mcol3, mcol4, mcol5, mcol6, mcol7 = st.columns(7)
+        mcols = st.columns(8)
 
         ret_color = "positive" if metrics["total_return"] > 0 else "negative"
-        with mcol1:
+        with mcols[0]:
             st.markdown(metric_card("Net Profit", f"{metrics['total_return']:+.2f}%", ret_color),
                         unsafe_allow_html=True)
-        with mcol2:
-            dd_color = "warning" if abs(metrics["max_drawdown"]) > 20 else "neutral"
-            st.markdown(metric_card("Max Equity DD", f"{metrics['max_drawdown']:.2f}%", dd_color),
-                        unsafe_allow_html=True)
-        with mcol3:
-            st.markdown(metric_card("Total Trades", f"{metrics['total_trades']}", "neutral"),
-                        unsafe_allow_html=True)
-        with mcol4:
-            wr_color = "positive" if metrics["win_rate"] > 50 else "warning"
-            st.markdown(metric_card("Win Rate", f"{metrics['win_rate']:.2f}%", wr_color),
-                        unsafe_allow_html=True)
-        with mcol5:
+        with mcols[1]:
             sh_color = "positive" if metrics["sharpe"] > 1 else "neutral"
             st.markdown(metric_card("Sharpe Ratio", f"{metrics['sharpe']:.3f}", sh_color),
                         unsafe_allow_html=True)
-        with mcol6:
-            st.markdown(metric_card("Sortino Ratio", f"{metrics['sortino']:.3f}",
+        with mcols[2]:
+            wr_color = "positive" if metrics["win_rate"] > 50 else "warning"
+            st.markdown(metric_card("Win Rate", f"{metrics['win_rate']:.1f}%", wr_color),
+                        unsafe_allow_html=True)
+        with mcols[3]:
+            avg_pnl = metrics["total_return"] / max(metrics["total_trades"], 1)
+            avg_color = "positive" if avg_pnl > 0 else "negative"
+            st.markdown(metric_card("Avg Trade", f"{avg_pnl:+.2f}%", avg_color),
+                        unsafe_allow_html=True)
+        with mcols[4]:
+            dd_color = "warning" if abs(metrics["max_drawdown"]) > 20 else "neutral"
+            st.markdown(metric_card("Max Drawdown", f"{metrics['max_drawdown']:.2f}%", dd_color),
+                        unsafe_allow_html=True)
+        with mcols[5]:
+            pf_color = "positive" if metrics["profit_factor"] > 1.5 else "neutral"
+            st.markdown(metric_card("Profit Factor", f"{metrics['profit_factor']:.3f}", pf_color),
+                        unsafe_allow_html=True)
+        with mcols[6]:
+            st.markdown(metric_card("Sortino", f"{metrics['sortino']:.3f}",
                                      "positive" if metrics["sortino"] > 1 else "neutral"),
                         unsafe_allow_html=True)
-        with mcol7:
-            if bs_result:
-                bp_color = "positive" if bs_result["pass_rate"] > 70 else "warning"
-                st.markdown(metric_card("Bootstrap Pass %", f"{bs_result['pass_rate']:.0f}%", bp_color),
-                            unsafe_allow_html=True)
-            else:
-                pf_color = "positive" if metrics["profit_factor"] > 1.5 else "neutral"
-                st.markdown(metric_card("Profit Factor", f"{metrics['profit_factor']:.3f}", pf_color),
-                            unsafe_allow_html=True)
+        with mcols[7]:
+            st.markdown(metric_card("Total Trades", f"{metrics['total_trades']}", "neutral"),
+                        unsafe_allow_html=True)
 
-        # Simulation result badge
-        is_validated = (
-            metrics["sharpe"] > 0.3
-            and metrics["total_return"] > 0
-            and metrics["total_trades"] > 10
-            and metrics["profit_factor"] > 1.0
-        )
-        badge_class = "badge-validated" if is_validated else "badge-failed"
-        badge_text = "VALIDATED" if is_validated else "NOT VALIDATED"
+        # Validation badge (tiered)
+        badge_class, badge_text = get_validation_badge(metrics)
         st.markdown(f'<div style="text-align: right;"><span class="{badge_class}">{badge_text}</span></div>',
                     unsafe_allow_html=True)
 
@@ -654,11 +841,11 @@ if st.session_state.results is not None:
             st.rerun()
 
         # ---------------------------------------------------------------
-        # Tabs: Charts / Details / All Strategies
+        # Tabs
         # ---------------------------------------------------------------
-        tab_oos, tab_is, tab_bootstrap, tab_details, tab_all = st.tabs([
-            "OUT-OF-SAMPLE", "IN-SAMPLE", "BOOTSTRAP", "Strategy Details", "All Strategies"
-        ])
+        tab_names = ["OUT-OF-SAMPLE", "IN-SAMPLE", "BOOTSTRAP", "WALK-FORWARD",
+                      "Strategy Details", "All Strategies", "FAVORITES"]
+        tab_oos, tab_is, tab_bootstrap, tab_wf, tab_details, tab_all, tab_fav = st.tabs(tab_names)
 
         with tab_is:
             if st.session_state.train is not None:
@@ -672,21 +859,25 @@ if st.session_state.results is not None:
                         st.plotly_chart(create_drawdown_chart(metrics_is["portfolio"]),
                                        use_container_width=True)
 
+                    # Trade distribution
+                    trade_chart = create_trade_distribution_chart(metrics_is.get("trades"))
+                    if trade_chart:
+                        st.plotly_chart(trade_chart, use_container_width=True)
+
                     # Detailed metrics table
-                    st.markdown('<div class="section-header">Normal Training</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="section-header">In-Sample Metrics</div>', unsafe_allow_html=True)
                     stats_data = {
-                        "Metric": ["Net Profit", "Net Profit %", "Avg Bars In Trades",
-                                   "Avg PnL", "Profit Factor", "Win Rate", "Sharpe",
-                                   "Sortino", "Total Closed Trades", "Max Drawdown %"],
-                        "ALL": [
-                            f"{metrics_is['total_return']:.2f}",
+                        "Metric": ["Net Profit %", "Sharpe Ratio", "Sortino Ratio", "Calmar Ratio",
+                                   "Profit Factor", "Win Rate", "Avg Trade %",
+                                   "Total Trades", "Max Drawdown %"],
+                        "Value": [
                             f"{metrics_is['total_return']:.2f}%",
-                            "N/A",
-                            f"{metrics_is['total_return']/max(metrics_is['total_trades'],1):.2f}",
-                            f"{metrics_is['profit_factor']:.2f}",
+                            f"{metrics_is['sharpe']:.3f}",
+                            f"{metrics_is['sortino']:.3f}",
+                            f"{metrics_is['calmar']:.3f}",
+                            f"{metrics_is['profit_factor']:.3f}",
                             f"{metrics_is['win_rate']:.2f}%",
-                            f"{metrics_is['sharpe']:.2f}",
-                            f"{metrics_is['sortino']:.2f}",
+                            f"{metrics_is['total_return']/max(metrics_is['total_trades'],1):.3f}%",
                             f"{metrics_is['total_trades']}",
                             f"{metrics_is['max_drawdown']:.2f}%",
                         ],
@@ -708,18 +899,41 @@ if st.session_state.results is not None:
                         st.plotly_chart(create_drawdown_chart(metrics_oos["portfolio"]),
                                        use_container_width=True)
 
-                    # OOS metrics
-                    oos_cols = st.columns(5)
+                    # OOS metrics row
+                    oos_cols = st.columns(6)
                     with oos_cols[0]:
-                        st.metric("OOS Return", f"{metrics_oos['total_return']:.2f}%")
+                        st.markdown(metric_card("OOS Return", f"{metrics_oos['total_return']:+.2f}%",
+                                                 "positive" if metrics_oos['total_return'] > 0 else "negative"),
+                                    unsafe_allow_html=True)
                     with oos_cols[1]:
-                        st.metric("OOS Sharpe", f"{metrics_oos['sharpe']:.3f}")
+                        st.markdown(metric_card("OOS Sharpe", f"{metrics_oos['sharpe']:.3f}",
+                                                 "positive" if metrics_oos['sharpe'] > 1 else "neutral"),
+                                    unsafe_allow_html=True)
                     with oos_cols[2]:
-                        st.metric("OOS Win Rate", f"{metrics_oos['win_rate']:.1f}%")
+                        st.markdown(metric_card("OOS Win Rate", f"{metrics_oos['win_rate']:.1f}%",
+                                                 "positive" if metrics_oos['win_rate'] > 50 else "warning"),
+                                    unsafe_allow_html=True)
                     with oos_cols[3]:
-                        st.metric("OOS Max DD", f"{metrics_oos['max_drawdown']:.2f}%")
+                        st.markdown(metric_card("OOS Max DD", f"{metrics_oos['max_drawdown']:.2f}%",
+                                                 "warning" if abs(metrics_oos['max_drawdown']) > 20 else "neutral"),
+                                    unsafe_allow_html=True)
                     with oos_cols[4]:
-                        st.metric("OOS Trades", f"{metrics_oos['total_trades']}")
+                        st.markdown(metric_card("Profit Factor", f"{metrics_oos['profit_factor']:.3f}",
+                                                 "positive" if metrics_oos['profit_factor'] > 1.5 else "neutral"),
+                                    unsafe_allow_html=True)
+                    with oos_cols[5]:
+                        st.markdown(metric_card("OOS Trades", f"{metrics_oos['total_trades']}", "neutral"),
+                                    unsafe_allow_html=True)
+
+                    # Trade distribution
+                    trade_chart = create_trade_distribution_chart(metrics_oos.get("trades"))
+                    if trade_chart:
+                        st.plotly_chart(trade_chart, use_container_width=True)
+
+                    # OOS validation badge
+                    oos_badge_class, oos_badge_text = get_validation_badge(metrics_oos)
+                    st.markdown(f'<div style="text-align: center;"><span class="{oos_badge_class}">'
+                                f'OOS: {oos_badge_text}</span></div>', unsafe_allow_html=True)
                 else:
                     st.warning("No trades generated out-of-sample")
             else:
@@ -756,17 +970,144 @@ if st.session_state.results is not None:
                                     unsafe_allow_html=True)
                     st.plotly_chart(create_bootstrap_chart(bs), use_container_width=True)
 
+        # ---------------------------------------------------------------
+        # Walk-Forward Tab
+        # ---------------------------------------------------------------
+        with tab_wf:
+            if st.session_state.wf_results is not None:
+                wf = st.session_state.wf_results
+
+                # Summary metrics
+                st.markdown('<div class="section-header">Walk-Forward Summary</div>', unsafe_allow_html=True)
+                wf_cols = st.columns(6)
+                with wf_cols[0]:
+                    st.markdown(metric_card("Folds", f"{wf['n_folds']}", "neutral"), unsafe_allow_html=True)
+                with wf_cols[1]:
+                    st.markdown(metric_card("Profitable Folds",
+                                             f"{wf['profitable_folds']}/{wf['n_folds']}",
+                                             "positive" if wf['profitable_pct'] > 60 else "warning"),
+                                unsafe_allow_html=True)
+                with wf_cols[2]:
+                    st.markdown(metric_card("Mean OOS Return",
+                                             f"{wf['mean_oos_return']:+.2f}%",
+                                             "positive" if wf['mean_oos_return'] > 0 else "negative"),
+                                unsafe_allow_html=True)
+                with wf_cols[3]:
+                    st.markdown(metric_card("Median OOS Return",
+                                             f"{wf['median_oos_return']:+.2f}%",
+                                             "positive" if wf['median_oos_return'] > 0 else "negative"),
+                                unsafe_allow_html=True)
+                with wf_cols[4]:
+                    st.markdown(metric_card("Mean OOS Sharpe",
+                                             f"{wf['mean_oos_sharpe']:.3f}",
+                                             "positive" if wf['mean_oos_sharpe'] > 0.5 else "neutral"),
+                                unsafe_allow_html=True)
+                with wf_cols[5]:
+                    st.markdown(metric_card("Total Time",
+                                             f"{wf['total_time']:.0f}s",
+                                             "neutral"),
+                                unsafe_allow_html=True)
+
+                # Fold Visualizer
+                st.markdown('<div class="section-header">Fold Visualizer</div>', unsafe_allow_html=True)
+                fold_chart = create_walk_forward_fold_chart(
+                    wf["folds"], wf["train_months"], wf["test_months"])
+                st.plotly_chart(fold_chart, use_container_width=True)
+
+                # Stitched OOS Equity Curve
+                if wf["stitched_equity"] is not None:
+                    st.markdown('<div class="section-header">Stitched OOS Equity Curve</div>',
+                                unsafe_allow_html=True)
+                    st.plotly_chart(create_equity_chart(wf["stitched_equity"],
+                                                        "Walk-Forward Stitched OOS Equity"),
+                                   use_container_width=True)
+
+                # Per-fold results table
+                st.markdown('<div class="section-header">Per-Fold Results</div>', unsafe_allow_html=True)
+                fold_table_data = []
+                for f in wf["folds"]:
+                    fold_table_data.append({
+                        "Fold": f["fold_num"],
+                        "Train Window": f"{f['train_start'][:10]} to {f['train_end'][:10]}",
+                        "Test Window": f"{f['test_start'][:10]} to {f['test_end'][:10]}",
+                        "Direction": f["direction"],
+                        "Entry Indicators": ", ".join(f["entry_indicators"]),
+                        "Train Sharpe": f"{f['train_sharpe']:.3f}",
+                        "OOS Return": f"{f['oos_return']:+.2f}%",
+                        "OOS Sharpe": f"{f['oos_sharpe']:.3f}",
+                        "OOS Trades": f["oos_trades"],
+                        "OOS Win Rate": f"{f['oos_winrate']:.1f}%",
+                    })
+                st.dataframe(pd.DataFrame(fold_table_data), use_container_width=True, hide_index=True)
+
+                # OOS Return per fold bar chart
+                fold_returns = [f["oos_return"] for f in wf["folds"]]
+                fold_labels = [f"Fold {f['fold_num']}" for f in wf["folds"]]
+                colors = ['#00e676' if r > 0 else '#ff5252' for r in fold_returns]
+                fig_bar = go.Figure(go.Bar(
+                    x=fold_labels, y=fold_returns,
+                    marker_color=colors,
+                    text=[f"{r:+.1f}%" for r in fold_returns],
+                    textposition='outside',
+                ))
+                fig_bar.update_layout(
+                    title=dict(text='OOS Return per Fold', font=dict(color='#e0e0e0', size=16)),
+                    paper_bgcolor='#0a0e17',
+                    plot_bgcolor='#0a0e17',
+                    font=dict(color='#8892a4'),
+                    xaxis=dict(gridcolor='#1a2744'),
+                    yaxis=dict(gridcolor='#1a2744', title='Return (%)'),
+                    margin=dict(l=60, r=20, t=40, b=40),
+                    height=350,
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+            else:
+                st.info("Enable Walk-Forward in the sidebar and click 'RUN WALK-FORWARD' to begin. "
+                        "This trains the GA on rolling windows and tests blindly on unseen data - "
+                        "the gold standard for strategy validation.")
+
+        # ---------------------------------------------------------------
+        # Strategy Details Tab
+        # ---------------------------------------------------------------
         with tab_details:
             st.markdown('<div class="section-header">Strategy Parameters</div>', unsafe_allow_html=True)
 
             st.markdown(f'<div class="param-box"><pre>{strategy_description(current_strat)}</pre></div>',
                         unsafe_allow_html=True)
 
+            # Save to favorites button
+            fav_col1, fav_col2 = st.columns([1, 3])
+            with fav_col1:
+                if st.button("Save to Favorites", use_container_width=True):
+                    fav_entry = current_strat.to_dict()
+                    fav_entry["saved_at"] = datetime.datetime.now().isoformat()
+                    fav_entry["symbol"] = symbol if data_source == "Yahoo Finance" else "CSV"
+                    fav_entry["interval"] = interval if data_source == "Yahoo Finance" else "auto"
+                    fav_entry["description"] = strategy_description(current_strat)
+                    st.session_state.favorites.append(fav_entry)
+                    save_favorites(st.session_state.favorites)
+                    st.success("Strategy saved to favorites!")
+            with fav_col2:
+                sym_for_export = symbol if data_source == "Yahoo Finance" else "BTC-USD"
+                int_for_export = interval if data_source == "Yahoo Finance" else "1h"
+                script = export_strategy_script(current_strat, sym_for_export, int_for_export)
+                st.download_button(
+                    label="Export as Python Script",
+                    data=script,
+                    file_name=f"strategy_{current_strat.direction}_{current_strat.fitness_sharpe:.2f}.py",
+                    mime="text/x-python",
+                    use_container_width=True,
+                )
+
             # Evolution progress chart
             if gen_stats:
                 st.markdown('<div class="section-header">Evolution Progress</div>', unsafe_allow_html=True)
                 st.plotly_chart(create_generation_chart(gen_stats), use_container_width=True)
 
+        # ---------------------------------------------------------------
+        # All Strategies Tab
+        # ---------------------------------------------------------------
         with tab_all:
             st.markdown('<div class="section-header">All Top Strategies</div>', unsafe_allow_html=True)
 
@@ -783,8 +1124,8 @@ if st.session_state.results is not None:
                     "Sortino": f"{s.fitness_sortino:.3f}",
                     "Trades": s.fitness_trades,
                     "Direction": s.direction,
-                    "# Entry Rules": len(s.entry_conditions),
-                    "# Exit Rules": len(s.exit_conditions),
+                    "# Entry": len(s.entry_conditions),
+                    "# Exit": len(s.exit_conditions),
                     "SL %": f"{s.stop_loss_pct*100:.1f}",
                     "TP %": f"{s.take_profit_pct*100:.1f}",
                 })
@@ -804,6 +1145,110 @@ if st.session_state.results is not None:
                 font=dict(color='#8892a4'),
             )
             st.plotly_chart(fig, use_container_width=True)
+
+        # ---------------------------------------------------------------
+        # Favorites Tab
+        # ---------------------------------------------------------------
+        with tab_fav:
+            st.markdown('<div class="section-header">Saved Favorites</div>', unsafe_allow_html=True)
+
+            if st.session_state.favorites:
+                for i, fav in enumerate(st.session_state.favorites):
+                    with st.expander(
+                        f"#{i+1} | {fav.get('direction', 'N/A').upper()} | "
+                        f"Sharpe: {fav.get('fitness_sharpe', 0):.3f} | "
+                        f"Return: {fav.get('fitness_return', 0):.1f}% | "
+                        f"{fav.get('symbol', '')} {fav.get('interval', '')} | "
+                        f"Saved: {fav.get('saved_at', 'N/A')[:10]}"
+                    ):
+                        # Show strategy details
+                        if "description" in fav:
+                            st.markdown(f'<div class="param-box"><pre>{fav["description"]}</pre></div>',
+                                        unsafe_allow_html=True)
+
+                        # Metrics
+                        fc1, fc2, fc3, fc4 = st.columns(4)
+                        with fc1:
+                            st.markdown(metric_card("Sharpe", f"{fav.get('fitness_sharpe', 0):.3f}", "neutral"),
+                                        unsafe_allow_html=True)
+                        with fc2:
+                            st.markdown(metric_card("Return", f"{fav.get('fitness_return', 0):.1f}%",
+                                                     "positive" if fav.get('fitness_return', 0) > 0 else "negative"),
+                                        unsafe_allow_html=True)
+                        with fc3:
+                            st.markdown(metric_card("Win Rate", f"{fav.get('fitness_winrate', 0):.1f}%", "neutral"),
+                                        unsafe_allow_html=True)
+                        with fc4:
+                            st.markdown(metric_card("Profit Factor", f"{fav.get('fitness_profit_factor', 0):.3f}", "neutral"),
+                                        unsafe_allow_html=True)
+
+                        # Action buttons
+                        btn_col1, btn_col2, btn_col3 = st.columns(3)
+                        with btn_col1:
+                            # Export as script
+                            try:
+                                fav_strat = strategy_from_dict(fav)
+                                fav_script = export_strategy_script(
+                                    fav_strat,
+                                    fav.get("symbol", "BTC-USD"),
+                                    fav.get("interval", "1h"),
+                                )
+                                st.download_button(
+                                    label="Export Script",
+                                    data=fav_script,
+                                    file_name=f"favorite_{i+1}_{fav.get('direction', 'long')}.py",
+                                    mime="text/x-python",
+                                    key=f"export_fav_{i}",
+                                    use_container_width=True,
+                                )
+                            except Exception as e:
+                                st.error(f"Export error: {e}")
+                        with btn_col2:
+                            if st.button("Load Strategy", key=f"load_fav_{i}", use_container_width=True):
+                                try:
+                                    loaded_strat = strategy_from_dict(fav)
+                                    # Add to current results if we have results
+                                    if st.session_state.results is not None:
+                                        st.session_state.results["best_strategies"].insert(0, loaded_strat)
+                                        st.session_state.selected_strategy_idx = 0
+                                        st.success("Strategy loaded! Switch to other tabs to evaluate it.")
+                                        st.rerun()
+                                    else:
+                                        st.warning("Load data and run evolution first, then load favorites.")
+                                except Exception as e:
+                                    st.error(f"Load error: {e}")
+                        with btn_col3:
+                            if st.button("Delete", key=f"del_fav_{i}", use_container_width=True):
+                                st.session_state.favorites.pop(i)
+                                save_favorites(st.session_state.favorites)
+                                st.rerun()
+
+                # Export/Import favorites JSON
+                st.markdown("---")
+                exp_col1, exp_col2 = st.columns(2)
+                with exp_col1:
+                    st.download_button(
+                        label="Export All Favorites (JSON)",
+                        data=json.dumps(st.session_state.favorites, indent=2, default=str),
+                        file_name="geneticai_favorites.json",
+                        mime="application/json",
+                        use_container_width=True,
+                    )
+                with exp_col2:
+                    uploaded_favs = st.file_uploader("Import Favorites JSON", type=["json"],
+                                                      key="import_favs")
+                    if uploaded_favs is not None:
+                        try:
+                            imported = json.loads(uploaded_favs.read())
+                            st.session_state.favorites.extend(imported)
+                            save_favorites(st.session_state.favorites)
+                            st.success(f"Imported {len(imported)} favorites!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Import error: {e}")
+            else:
+                st.info("No favorites saved yet. Go to Strategy Details tab and click 'Save to Favorites' "
+                        "to save a strategy you like.")
 
     # ---------------------------------------------------------------
     # Evolution statistics
@@ -832,7 +1277,12 @@ else:
     3. **Run Evolution** to start the genetic optimization
     4. **Analyze** the results across In-Sample, Out-of-Sample, and Bootstrap tabs
 
-    The genetic algorithm will evolve combinations of 25 technical indicators including:
+    **New Features:**
+    - **Strategy Complexity**: Control how many indicators (2-6) the GA uses for entry/exit conditions
+    - **Walk-Forward Analysis**: Rolling train/test windows to expose curve-fitting
+    - **Favorites**: Save, export, and reload your best strategies as standalone Python scripts
+
+    The genetic algorithm will evolve combinations of 24 technical indicators including:
 
     """)
 

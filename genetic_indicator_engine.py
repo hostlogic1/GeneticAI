@@ -434,9 +434,10 @@ def random_condition(df: pd.DataFrame) -> IndicatorCondition:
     )
 
 
-def random_strategy(df: pd.DataFrame) -> TradingStrategy:
-    n_entry = random.randint(1, 3)
-    n_exit = random.randint(1, 2)
+def random_strategy(df: pd.DataFrame, min_entry: int = 2, max_entry: int = 4,
+                     min_exit: int = 1, max_exit: int = 2) -> TradingStrategy:
+    n_entry = random.randint(min_entry, max_entry)
+    n_exit = random.randint(min_exit, max_exit)
     return TradingStrategy(
         entry_conditions=[random_condition(df) for _ in range(n_entry)],
         exit_conditions=[random_condition(df) for _ in range(n_exit)],
@@ -679,13 +680,16 @@ def crossover(strat1: TradingStrategy, strat2: TradingStrategy) -> Tuple[Trading
     return child1, child2
 
 
-def mutate(strat: TradingStrategy, df: pd.DataFrame) -> TradingStrategy:
+def mutate(strat: TradingStrategy, df: pd.DataFrame,
+           min_entry: int = 2, max_entry: int = 4,
+           min_exit: int = 1, max_exit: int = 2) -> TradingStrategy:
     child = copy.deepcopy(strat)
 
     mutation_type = random.choice([
         "replace_entry_cond", "replace_exit_cond",
         "tweak_threshold", "tweak_sl_tp",
-        "add_condition", "remove_condition",
+        "add_entry_condition", "remove_entry_condition",
+        "add_exit_condition", "remove_exit_condition",
         "change_params", "flip_direction",
     ])
 
@@ -707,13 +711,21 @@ def mutate(strat: TradingStrategy, df: pd.DataFrame) -> TradingStrategy:
         child.stop_loss_pct = max(0.005, min(0.15, child.stop_loss_pct * random.uniform(0.7, 1.3)))
         child.take_profit_pct = max(0.01, min(0.30, child.take_profit_pct * random.uniform(0.7, 1.3)))
 
-    elif mutation_type == "add_condition":
-        if len(child.entry_conditions) < 4:
+    elif mutation_type == "add_entry_condition":
+        if len(child.entry_conditions) < max_entry:
             child.entry_conditions.append(random_condition(df))
 
-    elif mutation_type == "remove_condition":
-        if len(child.entry_conditions) > 1:
+    elif mutation_type == "remove_entry_condition":
+        if len(child.entry_conditions) > min_entry:
             child.entry_conditions.pop(random.randrange(len(child.entry_conditions)))
+
+    elif mutation_type == "add_exit_condition":
+        if len(child.exit_conditions) < max_exit:
+            child.exit_conditions.append(random_condition(df))
+
+    elif mutation_type == "remove_exit_condition":
+        if len(child.exit_conditions) > min_exit:
+            child.exit_conditions.pop(random.randrange(len(child.exit_conditions)))
 
     elif mutation_type == "change_params":
         all_conds = child.entry_conditions + child.exit_conditions
@@ -740,13 +752,18 @@ def run_evolution(
     tournament_size: int = 3,
     elite_size: int = 5,
     progress_callback=None,
+    min_entry: int = 2,
+    max_entry: int = 4,
+    min_exit: int = 1,
+    max_exit: int = 2,
 ) -> Dict:
     start_time = time.time()
     cache_train = IndicatorCache(df_train)
     cache_val = IndicatorCache(df_val) if df_val is not None else None
 
     print(f"Creating initial population of {pop_size} strategies...")
-    population = [random_strategy(df_train) for _ in range(pop_size)]
+    population = [random_strategy(df_train, min_entry, max_entry, min_exit, max_exit)
+                  for _ in range(pop_size)]
 
     generation_stats = []
     all_evaluated = []
@@ -832,9 +849,9 @@ def run_evolution(
                     child1, child2 = copy.deepcopy(parent1), copy.deepcopy(parent2)
 
                 if random.random() < p_mutation:
-                    child1 = mutate(child1, df_train)
+                    child1 = mutate(child1, df_train, min_entry, max_entry, min_exit, max_exit)
                 if random.random() < p_mutation:
-                    child2 = mutate(child2, df_train)
+                    child2 = mutate(child2, df_train, min_entry, max_entry, min_exit, max_exit)
 
                 new_population.append(child1)
                 if len(new_population) < pop_size:
@@ -997,7 +1014,404 @@ def load_results(path: str = "evolution_results.dill") -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# 13. Main Entry Point
+# 13. Walk-Forward Analysis
+# ---------------------------------------------------------------------------
+def generate_walk_forward_folds(df: pd.DataFrame, train_months: int = 12,
+                                 test_months: int = 3) -> List[Dict]:
+    """Generate rolling train/test fold windows."""
+    total_bars = len(df)
+    total_days = (df.index[-1] - df.index[0]).days
+    if total_days <= 0:
+        return []
+    bars_per_day = total_bars / total_days
+    train_bars = int(train_months * 30.44 * bars_per_day)
+    test_bars = int(test_months * 30.44 * bars_per_day)
+
+    folds = []
+    start = 0
+    fold_num = 1
+    while start + train_bars + test_bars <= total_bars:
+        train_end = start + train_bars
+        test_end = train_end + test_bars
+        folds.append({
+            "fold_num": fold_num,
+            "train_df": df.iloc[start:train_end].copy(),
+            "test_df": df.iloc[train_end:test_end].copy(),
+            "train_start": df.index[start],
+            "train_end": df.index[train_end - 1],
+            "test_start": df.index[train_end],
+            "test_end": df.index[min(test_end - 1, total_bars - 1)],
+        })
+        start += test_bars
+        fold_num += 1
+
+    return folds
+
+
+def run_walk_forward(
+    df: pd.DataFrame,
+    train_months: int = 12,
+    test_months: int = 3,
+    pop_size: int = 50,
+    n_generations: int = 15,
+    p_crossover: float = 0.7,
+    p_mutation: float = 0.3,
+    tournament_size: int = 3,
+    elite_size: int = 5,
+    min_entry: int = 2,
+    max_entry: int = 4,
+    min_exit: int = 1,
+    max_exit: int = 2,
+    progress_callback=None,
+) -> Dict:
+    """Run walk-forward analysis: GA optimization on each fold, blind OOS testing."""
+    start_time = time.time()
+    folds = generate_walk_forward_folds(df, train_months, test_months)
+
+    if not folds:
+        return {"error": "Not enough data for walk-forward folds"}
+
+    fold_results = []
+    oos_equity_segments = []
+
+    for i, fold in enumerate(folds):
+        fold_start = time.time()
+        print(f"\n--- Walk-Forward Fold {fold['fold_num']}/{len(folds)} ---")
+        print(f"  Train: {fold['train_start']} to {fold['train_end']} ({len(fold['train_df'])} bars)")
+        print(f"  Test:  {fold['test_start']} to {fold['test_end']} ({len(fold['test_df'])} bars)")
+
+        # Run GA on train data (no val split within fold - full train optimization)
+        results = run_evolution(
+            df_train=fold["train_df"],
+            df_val=None,
+            pop_size=pop_size,
+            n_generations=n_generations,
+            p_crossover=p_crossover,
+            p_mutation=p_mutation,
+            tournament_size=tournament_size,
+            elite_size=elite_size,
+            min_entry=min_entry,
+            max_entry=max_entry,
+            min_exit=min_exit,
+            max_exit=max_exit,
+        )
+
+        best = results["best_strategy"]
+
+        # Evaluate on train (IS)
+        cache_train = IndicatorCache(fold["train_df"])
+        train_metrics = backtest_strategy(best, fold["train_df"], cache_train)
+
+        # Evaluate on blind test (OOS)
+        cache_test = IndicatorCache(fold["test_df"])
+        test_metrics = backtest_strategy(best, fold["test_df"], cache_test)
+
+        fold_time = time.time() - fold_start
+        print(f"  IS  Return: {train_metrics['total_return']:+.2f}% | Sharpe: {train_metrics['sharpe']:.3f}")
+        print(f"  OOS Return: {test_metrics['total_return']:+.2f}% | Sharpe: {test_metrics['sharpe']:.3f}")
+        print(f"  Fold time: {fold_time:.1f}s")
+
+        # Collect OOS equity curve
+        if test_metrics["equity_curve"] is not None:
+            oos_equity_segments.append(test_metrics["equity_curve"])
+
+        # Summarize the strategy's key indicators
+        entry_indicators = [c.indicator_name for c in best.entry_conditions]
+        exit_indicators = [c.indicator_name for c in best.exit_conditions]
+
+        fold_results.append({
+            "fold_num": fold["fold_num"],
+            "train_start": str(fold["train_start"]),
+            "train_end": str(fold["train_end"]),
+            "test_start": str(fold["test_start"]),
+            "test_end": str(fold["test_end"]),
+            "train_bars": len(fold["train_df"]),
+            "test_bars": len(fold["test_df"]),
+            "strategy": best,
+            "entry_indicators": entry_indicators,
+            "exit_indicators": exit_indicators,
+            "direction": best.direction,
+            "train_return": train_metrics["total_return"],
+            "train_sharpe": train_metrics["sharpe"],
+            "train_trades": train_metrics["total_trades"],
+            "oos_return": test_metrics["total_return"],
+            "oos_sharpe": test_metrics["sharpe"],
+            "oos_trades": test_metrics["total_trades"],
+            "oos_winrate": test_metrics["win_rate"],
+            "oos_max_dd": test_metrics["max_drawdown"],
+            "oos_profit_factor": test_metrics["profit_factor"],
+            "fold_time": fold_time,
+        })
+
+        if progress_callback:
+            progress_callback(i + 1, len(folds), fold_results[-1])
+
+    # Stitch OOS equity curves
+    stitched_equity = _stitch_equity_curves(oos_equity_segments)
+
+    # Aggregate OOS metrics
+    oos_returns = [f["oos_return"] for f in fold_results]
+    oos_sharpes = [f["oos_sharpe"] for f in fold_results]
+    profitable_folds = sum(1 for r in oos_returns if r > 0)
+
+    total_time = time.time() - start_time
+    print(f"\nWalk-forward complete in {total_time:.1f}s ({total_time/60:.1f} min)")
+    print(f"  Folds: {len(folds)} | Profitable: {profitable_folds}/{len(folds)}")
+    print(f"  Mean OOS Return: {np.mean(oos_returns):.2f}% | Mean OOS Sharpe: {np.mean(oos_sharpes):.3f}")
+
+    return {
+        "folds": fold_results,
+        "n_folds": len(folds),
+        "stitched_equity": stitched_equity,
+        "mean_oos_return": np.mean(oos_returns),
+        "median_oos_return": np.median(oos_returns),
+        "mean_oos_sharpe": np.mean(oos_sharpes),
+        "profitable_folds": profitable_folds,
+        "profitable_pct": profitable_folds / len(folds) * 100 if folds else 0,
+        "total_oos_return": sum(oos_returns),
+        "total_time": total_time,
+        "train_months": train_months,
+        "test_months": test_months,
+    }
+
+
+def _stitch_equity_curves(segments: List[pd.Series]) -> Optional[pd.Series]:
+    """Stitch OOS equity curve segments into a continuous curve."""
+    if not segments:
+        return None
+
+    stitched_parts = []
+    cumulative_value = INITIAL_CASH
+
+    for seg in segments:
+        if seg is None or len(seg) == 0:
+            continue
+        # Normalize segment: scale so it starts at cumulative_value
+        start_val = seg.iloc[0]
+        if start_val == 0:
+            continue
+        scaled = seg / start_val * cumulative_value
+        stitched_parts.append(scaled)
+        cumulative_value = scaled.iloc[-1]
+
+    if not stitched_parts:
+        return None
+    return pd.concat(stitched_parts)
+
+
+# ---------------------------------------------------------------------------
+# 14. Favorites System
+# ---------------------------------------------------------------------------
+def strategy_from_dict(data: Dict) -> TradingStrategy:
+    """Reconstruct a TradingStrategy from a dict."""
+    entry_conds = [IndicatorCondition(**c) for c in data.get("entry_conditions", [])]
+    exit_conds = [IndicatorCondition(**c) for c in data.get("exit_conditions", [])]
+    strat = TradingStrategy(
+        entry_conditions=entry_conds,
+        exit_conditions=exit_conds,
+        stop_loss_pct=data.get("stop_loss_pct", 0.05),
+        take_profit_pct=data.get("take_profit_pct", 0.10),
+        direction=data.get("direction", "long"),
+    )
+    for key in ["fitness_sharpe", "fitness_return", "fitness_trades", "fitness_winrate",
+                "fitness_max_dd", "fitness_profit_factor", "fitness_sortino",
+                "fitness_calmar", "fitness_score"]:
+        if key in data:
+            setattr(strat, key, data[key])
+    return strat
+
+
+def save_favorites(favorites: List[Dict], path: str = "favorites.json"):
+    """Save favorite strategies to JSON."""
+    with open(path, "w") as f:
+        json.dump(favorites, f, indent=2, default=str)
+
+
+def load_favorites(path: str = "favorites.json") -> List[Dict]:
+    """Load favorite strategies from JSON."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def export_strategy_script(strategy: TradingStrategy, symbol: str = "SOL-USD",
+                            interval: str = "1h") -> str:
+    """Generate a standalone Python trading script for a strategy."""
+    # Collect which indicators are needed
+    all_conds = strategy.entry_conditions + strategy.exit_conditions
+    used_indicators = set()
+    for c in all_conds:
+        used_indicators.add(c.indicator_name)
+
+    # Build condition code
+    entry_code_lines = []
+    for i, c in enumerate(strategy.entry_conditions):
+        params_str = ", ".join(f"{k}={repr(v)}" for k, v in c.params.items())
+        var_name = f"entry_{i}_{c.output_key}"
+        entry_code_lines.append(f"    # Entry condition {i+1}: {c.indicator_name}({params_str}) {c.condition_type}")
+        entry_code_lines.append(f"    {var_name} = compute_indicator(df, '{c.indicator_name}', {{{params_str}}}, '{c.output_key}')")
+        if c.condition_type == "is_above":
+            entry_code_lines.append(f"    entry_sig_{i} = {var_name} > {c.threshold}")
+        elif c.condition_type == "is_below":
+            entry_code_lines.append(f"    entry_sig_{i} = {var_name} < {c.threshold}")
+        elif c.condition_type == "rising":
+            entry_code_lines.append(f"    entry_sig_{i} = {var_name} > {var_name}.shift(1)")
+        elif c.condition_type == "falling":
+            entry_code_lines.append(f"    entry_sig_{i} = {var_name} < {var_name}.shift(1)")
+        elif c.condition_type == "crosses_above":
+            entry_code_lines.append(f"    entry_sig_{i} = ({var_name} > {c.threshold}) & ({var_name}.shift(1) <= {c.threshold})")
+        elif c.condition_type == "crosses_below":
+            entry_code_lines.append(f"    entry_sig_{i} = ({var_name} < {c.threshold}) & ({var_name}.shift(1) >= {c.threshold})")
+
+    exit_code_lines = []
+    for i, c in enumerate(strategy.exit_conditions):
+        params_str = ", ".join(f"{k}={repr(v)}" for k, v in c.params.items())
+        var_name = f"exit_{i}_{c.output_key}"
+        exit_code_lines.append(f"    # Exit condition {i+1}: {c.indicator_name}({params_str}) {c.condition_type}")
+        exit_code_lines.append(f"    {var_name} = compute_indicator(df, '{c.indicator_name}', {{{params_str}}}, '{c.output_key}')")
+        if c.condition_type == "is_above":
+            exit_code_lines.append(f"    exit_sig_{i} = {var_name} > {c.threshold}")
+        elif c.condition_type == "is_below":
+            exit_code_lines.append(f"    exit_sig_{i} = {var_name} < {c.threshold}")
+        elif c.condition_type == "rising":
+            exit_code_lines.append(f"    exit_sig_{i} = {var_name} > {var_name}.shift(1)")
+        elif c.condition_type == "falling":
+            exit_code_lines.append(f"    exit_sig_{i} = {var_name} < {var_name}.shift(1)")
+        elif c.condition_type == "crosses_above":
+            exit_code_lines.append(f"    exit_sig_{i} = ({var_name} > {c.threshold}) & ({var_name}.shift(1) <= {c.threshold})")
+        elif c.condition_type == "crosses_below":
+            exit_code_lines.append(f"    exit_sig_{i} = ({var_name} < {c.threshold}) & ({var_name}.shift(1) >= {c.threshold})")
+
+    n_entry = len(strategy.entry_conditions)
+    n_exit = len(strategy.exit_conditions)
+    entry_combine = " & ".join(f"entry_sig_{i}" for i in range(n_entry))
+    exit_combine = " | ".join(f"exit_sig_{i}" for i in range(n_exit))
+
+    script = f'''"""
+GeneticAI Exported Strategy
+============================
+Auto-generated trading strategy from GeneticAI optimizer.
+Symbol: {symbol} | Interval: {interval}
+Direction: {strategy.direction.upper()}
+Stop Loss: {strategy.stop_loss_pct*100:.1f}% | Take Profit: {strategy.take_profit_pct*100:.1f}%
+"""
+
+import pandas as pd
+import numpy as np
+import ta as ta_lib
+import yfinance as yf
+
+# ---------------------------------------------------------------------------
+# Strategy Configuration
+# ---------------------------------------------------------------------------
+SYMBOL = "{symbol}"
+INTERVAL = "{interval}"
+DIRECTION = "{strategy.direction}"
+STOP_LOSS_PCT = {strategy.stop_loss_pct}
+TAKE_PROFIT_PCT = {strategy.take_profit_pct}
+
+# ---------------------------------------------------------------------------
+# Indicator Registry (subset used by this strategy)
+# ---------------------------------------------------------------------------
+INDICATORS = {{
+    "RSI": lambda df, p: {{"RSI": ta_lib.momentum.RSIIndicator(df["Close"], window=p["period"]).rsi()}},
+    "SMA": lambda df, p: {{"SMA_fast": ta_lib.trend.SMAIndicator(df["Close"], window=p["fast"]).sma_indicator(), "SMA_slow": ta_lib.trend.SMAIndicator(df["Close"], window=p["slow"]).sma_indicator()}},
+    "EMA": lambda df, p: {{"EMA_fast": ta_lib.trend.EMAIndicator(df["Close"], window=p["fast"]).ema_indicator(), "EMA_slow": ta_lib.trend.EMAIndicator(df["Close"], window=p["slow"]).ema_indicator()}},
+    "MACD": lambda df, p: {{"MACD_line": ta_lib.trend.MACD(df["Close"], window_fast=p["fast"], window_slow=p["slow"], window_sign=p["signal"]).macd(), "MACD_signal": ta_lib.trend.MACD(df["Close"], window_fast=p["fast"], window_slow=p["slow"], window_sign=p["signal"]).macd_signal(), "MACD_hist": ta_lib.trend.MACD(df["Close"], window_fast=p["fast"], window_slow=p["slow"], window_sign=p["signal"]).macd_diff()}},
+    "Stochastic": lambda df, p: {{"STOCH_K": ta_lib.momentum.StochasticOscillator(df["High"], df["Low"], df["Close"], window=p["k"], smooth_window=p["d"]).stoch(), "STOCH_D": ta_lib.momentum.StochasticOscillator(df["High"], df["Low"], df["Close"], window=p["k"], smooth_window=p["d"]).stoch_signal()}},
+    "ADX": lambda df, p: {{"ADX": ta_lib.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=p["period"]).adx(), "DI_plus": ta_lib.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=p["period"]).adx_pos(), "DI_minus": ta_lib.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=p["period"]).adx_neg()}},
+    "CCI": lambda df, p: {{"CCI": ta_lib.trend.CCIIndicator(df["High"], df["Low"], df["Close"], window=p["period"]).cci()}},
+    "ROC": lambda df, p: {{"ROC": ta_lib.momentum.ROCIndicator(df["Close"], window=p["period"]).roc()}},
+    "MFI": lambda df, p: {{"MFI": ta_lib.volume.MFIIndicator(df["High"], df["Low"], df["Close"], df["Volume"], window=p["period"]).money_flow_index()}},
+    "BollingerBands": lambda df, p: {{"BB_upper": ta_lib.volatility.BollingerBands(df["Close"], window=p["period"], window_dev=p["std"]).bollinger_hband(), "BB_mid": ta_lib.volatility.BollingerBands(df["Close"], window=p["period"], window_dev=p["std"]).bollinger_mavg(), "BB_lower": ta_lib.volatility.BollingerBands(df["Close"], window=p["period"], window_dev=p["std"]).bollinger_lband(), "BB_pctb": ta_lib.volatility.BollingerBands(df["Close"], window=p["period"], window_dev=p["std"]).bollinger_pband()}},
+    "KeltnerChannel": lambda df, p: {{"KC_upper": ta_lib.volatility.KeltnerChannel(df["High"], df["Low"], df["Close"], window=p["period"], multiplier=p["atr_mult"]).keltner_channel_hband(), "KC_basis": ta_lib.volatility.KeltnerChannel(df["High"], df["Low"], df["Close"], window=p["period"], multiplier=p["atr_mult"]).keltner_channel_mband(), "KC_lower": ta_lib.volatility.KeltnerChannel(df["High"], df["Low"], df["Close"], window=p["period"], multiplier=p["atr_mult"]).keltner_channel_lband()}},
+    "KAMA": lambda df, p: {{"KAMA": ta_lib.momentum.KAMAIndicator(df["Close"], window=p["period"]).kama()}},
+    "WilliamsR": lambda df, p: {{"WILLR": ta_lib.momentum.WilliamsRIndicator(df["High"], df["Low"], df["Close"], lbp=p["period"]).williams_r()}},
+    "ATR": lambda df, p: {{"ATR": ta_lib.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=p["period"]).average_true_range()}},
+    "OBV": lambda df, p: {{"OBV": ta_lib.volume.OnBalanceVolumeIndicator(df["Close"], df["Volume"]).on_balance_volume()}},
+    "Aroon": lambda df, p: {{"AROON_up": ta_lib.trend.AroonIndicator(df["Close"], window=p["period"]).aroon_up(), "AROON_down": ta_lib.trend.AroonIndicator(df["Close"], window=p["period"]).aroon_down()}},
+    "CMF": lambda df, p: {{"CMF": ta_lib.volume.ChaikinMoneyFlowIndicator(df["High"], df["Low"], df["Close"], df["Volume"], window=p["period"]).chaikin_money_flow()}},
+    "TSI": lambda df, p: {{"TSI": ta_lib.momentum.TSIIndicator(df["Close"], window_slow=p["fast"], window_fast=p["slow"]).tsi()}},
+    "PPO": lambda df, p: {{"PPO": ta_lib.momentum.PercentagePriceOscillator(df["Close"], window_fast=p["fast"], window_slow=p["slow"]).ppo()}},
+    "UltimateOscillator": lambda df, p: {{"UO": ta_lib.momentum.UltimateOscillator(df["High"], df["Low"], df["Close"], window1=p["fast"], window2=p["medium"], window3=p["slow"]).ultimate_oscillator()}},
+    "Ichimoku": lambda df, p: {{"ICH_conv": ta_lib.trend.IchimokuIndicator(df["High"], df["Low"], window1=p["tenkan"], window2=p["kijun"]).ichimoku_conversion_line(), "ICH_base": ta_lib.trend.IchimokuIndicator(df["High"], df["Low"], window1=p["tenkan"], window2=p["kijun"]).ichimoku_base_line()}},
+    "DPO": lambda df, p: {{"DPO": ta_lib.trend.DPOIndicator(df["Close"], window=p["period"]).dpo()}},
+    "VWAP": lambda df, p: {{"VWAP": ta_lib.volume.VolumeWeightedAveragePrice(df["High"], df["Low"], df["Close"], df["Volume"]).volume_weighted_average_price()}},
+    "AwesomeOscillator": lambda df, p: {{"AO": ta_lib.momentum.AwesomeOscillatorIndicator(df["High"], df["Low"], window1=p["fast"], window2=p["slow"]).awesome_oscillator()}},
+}}
+
+
+def compute_indicator(df, name, params, output_key):
+    """Compute a single indicator output."""
+    outputs = INDICATORS[name](df, params)
+    return outputs.get(output_key, pd.Series(np.nan, index=df.index))
+
+
+def generate_signals(df):
+    """Generate entry and exit signals for the strategy."""
+{chr(10).join(entry_code_lines)}
+
+    entry_signal = {entry_combine}
+    entry_signal = entry_signal.fillna(False).astype(bool)
+
+{chr(10).join(exit_code_lines)}
+
+    exit_signal = {exit_combine}
+    exit_signal = exit_signal.fillna(False).astype(bool)
+
+    return entry_signal, exit_signal
+
+
+def get_current_signal(df):
+    """Get the latest signal from the most recent bar."""
+    entries, exits = generate_signals(df)
+    last_entry = entries.iloc[-1] if len(entries) > 0 else False
+    last_exit = exits.iloc[-1] if len(exits) > 0 else False
+
+    if last_entry:
+        return "ENTRY"
+    elif last_exit:
+        return "EXIT"
+    return "HOLD"
+
+
+def main():
+    print(f"Downloading {{SYMBOL}} {{INTERVAL}} data...")
+    ticker = yf.Ticker(SYMBOL)
+    df = ticker.history(period="1mo", interval=INTERVAL)
+    if df.empty:
+        print("No data returned!")
+        return
+
+    print(f"Got {{len(df)}} bars")
+    entries, exits = generate_signals(df)
+
+    # Show last 5 signals
+    print("\\nRecent signals:")
+    for i in range(-5, 0):
+        date = df.index[i]
+        price = df["Close"].iloc[i]
+        e = "ENTRY" if entries.iloc[i] else ""
+        x = "EXIT" if exits.iloc[i] else ""
+        sig = e or x or "HOLD"
+        print(f"  {{date}} | Price: {{price:.4f}} | Signal: {{sig}}")
+
+    signal = get_current_signal(df)
+    print(f"\\nCurrent Signal: {{signal}}")
+    print(f"Direction: {{DIRECTION.upper()}}")
+    print(f"Stop Loss: {{STOP_LOSS_PCT*100:.1f}}% | Take Profit: {{TAKE_PROFIT_PCT*100:.1f}}%")
+
+
+if __name__ == "__main__":
+    main()
+'''
+    return script
+
+
+# ---------------------------------------------------------------------------
+# 15. Main Entry Point
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 70)
