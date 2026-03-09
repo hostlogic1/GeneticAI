@@ -598,6 +598,37 @@ def backtest_strategy(
         except Exception:
             trades_records = pd.DataFrame()
 
+        # Extract per-trade stats for consistency scoring
+        avg_win = 0.0
+        avg_loss = 0.0
+        expectancy = 0.0
+        tail_ratio = 0.0
+        try:
+            trade_pnls = pf.trades.pnl.values
+            if len(trade_pnls) > 0:
+                winners = trade_pnls[trade_pnls > 0]
+                losers = trade_pnls[trade_pnls < 0]
+                avg_win = float(np.mean(winners)) if len(winners) > 0 else 0.0
+                avg_loss = float(np.mean(losers)) if len(losers) > 0 else 0.0
+                wr = len(winners) / len(trade_pnls)
+                lr = 1.0 - wr
+                expectancy = (wr * avg_win + lr * avg_loss) if avg_loss != 0 else avg_win * wr
+                # Tail ratio: are big moves in our favor? (95th pctl win / 5th pctl loss)
+                p95 = float(np.percentile(trade_pnls, 95)) if len(trade_pnls) > 5 else 0.0
+                p5 = float(np.percentile(trade_pnls, 5)) if len(trade_pnls) > 5 else -1.0
+                tail_ratio = abs(p95 / p5) if p5 != 0 else 0.0
+        except Exception:
+            pass
+
+        # Equity curve smoothness (lower = smoother = better)
+        equity_volatility = 0.0
+        try:
+            if equity_curve is not None and len(equity_curve) > 10:
+                eq_returns = equity_curve.pct_change().dropna()
+                equity_volatility = float(eq_returns.std()) if len(eq_returns) > 0 else 0.0
+        except Exception:
+            pass
+
         return {
             "total_return": total_return,
             "sharpe": sharpe,
@@ -611,6 +642,11 @@ def backtest_strategy(
             "trades": trades_records,
             "portfolio": pf,
             "stats": stats,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "expectancy": expectancy,
+            "tail_ratio": tail_ratio,
+            "equity_volatility": equity_volatility,
         }
 
     except Exception:
@@ -631,24 +667,112 @@ def _empty_metrics():
         "trades": pd.DataFrame(),
         "portfolio": None,
         "stats": None,
+        "avg_win": 0.0,
+        "avg_loss": 0.0,
+        "expectancy": 0.0,
+        "tail_ratio": 0.0,
+        "equity_volatility": 0.0,
     }
 
 
-def compute_fitness_score(metrics: Dict) -> float:
-    if metrics["total_trades"] < 5:
+def compute_fitness_score(metrics: Dict, val_metrics: Dict = None) -> float:
+    """
+    Improved fitness function designed to find ROBUST strategies, not flashy ones.
+
+    Key principles:
+    - Profit Factor is king (PF > 1.5 = you make 50% more on winners than losers)
+    - Drawdown is heavily penalized (real traders can't stomach 40%+ DD)
+    - Trade count matters: more trades = more statistical confidence
+    - Consistency beats one big winner
+    - IS/OOS gap is penalized when validation data is available
+    """
+    trades = metrics["total_trades"]
+    if trades < 5:
         return -999.0
 
-    score = (
-        metrics["sharpe"] * 2.0
-        + metrics["sortino"] * 1.5
-        + (metrics["total_return"] / 100.0) * 1.0
-        + (metrics["win_rate"] / 100.0) * 0.5
-        + min(metrics["profit_factor"], 5.0) * 1.0
-        - abs(metrics["max_drawdown"]) / 100.0 * 2.0
+    sharpe = metrics["sharpe"]
+    sortino = metrics["sortino"]
+    total_return = metrics["total_return"]
+    win_rate = metrics["win_rate"]
+    profit_factor = metrics["profit_factor"]
+    max_dd = abs(metrics["max_drawdown"])
+    calmar = metrics.get("calmar", 0.0)
+    expectancy = metrics.get("expectancy", 0.0)
+    tail_ratio = metrics.get("tail_ratio", 0.0)
+
+    # --- Core Score Components ---
+
+    # 1. Profit Factor (capped at 4.0 to avoid rewarding lucky outliers)
+    #    PF = 1.0 is breakeven, 1.5+ is good, 2.0+ is excellent
+    pf_score = min(profit_factor, 4.0) * 2.0
+
+    # 2. Sharpe (capped at 3.0 - anything higher is suspicious)
+    sharpe_score = min(max(sharpe, -2.0), 3.0) * 1.5
+
+    # 3. Win Rate bonus (scaled: 50% = neutral, 60%+ = good)
+    wr_score = (win_rate - 50.0) / 10.0  # +1 per 10% above 50%
+
+    # 4. Return (logarithmic scaling - diminishing returns above 50%)
+    if total_return > 0:
+        ret_score = math.log1p(total_return) * 0.8
+    else:
+        ret_score = total_return / 50.0  # Negative returns penalized linearly
+
+    # 5. Calmar ratio (return / max drawdown - rewards risk-adjusted returns)
+    calmar_capped = min(max(calmar, -2.0), 5.0) if np.isfinite(calmar) else 0.0
+    calmar_score = calmar_capped * 0.8
+
+    # --- Penalty Components ---
+
+    # 6. Drawdown penalty (exponential - gets much worse above 25%)
+    if max_dd < 15:
+        dd_penalty = max_dd * 0.05  # Mild penalty under 15%
+    elif max_dd < 30:
+        dd_penalty = 0.75 + (max_dd - 15) * 0.10  # Moderate 15-30%
+    else:
+        dd_penalty = 2.25 + (max_dd - 30) * 0.20  # Severe above 30%
+
+    # 7. Trade count scaling (gradual, not binary)
+    #    10 trades = 0.4x, 20 = 0.6x, 30 = 0.75x, 50 = 0.9x, 80+ = 1.0x
+    trade_multiplier = min(1.0, 0.3 + 0.7 * (trades / 80.0))
+
+    # 8. Expectancy bonus (positive expectancy per trade is crucial)
+    exp_score = 0.0
+    if expectancy > 0:
+        exp_score = min(expectancy / 100.0, 1.0) * 1.0  # Cap at 1.0 bonus
+
+    # --- Combine ---
+    raw_score = (
+        pf_score
+        + sharpe_score
+        + wr_score
+        + ret_score
+        + calmar_score
+        + exp_score
+        - dd_penalty
     )
 
-    if metrics["total_trades"] < 20:
-        score *= 0.5
+    # Apply trade count multiplier
+    score = raw_score * trade_multiplier
+
+    # --- Validation Penalty (fight overfitting!) ---
+    if val_metrics is not None and val_metrics["total_trades"] >= 3:
+        val_return = val_metrics["total_return"]
+        val_sharpe = val_metrics["sharpe"]
+
+        # Penalize large IS/OOS gaps
+        if total_return > 0 and val_return > 0:
+            # Both positive - reward consistency
+            return_ratio = min(val_return, total_return) / max(val_return, total_return, 0.01)
+            score *= (0.5 + 0.5 * return_ratio)  # Scale 0.5x to 1.0x
+        elif total_return > 0 and val_return <= 0:
+            # Positive IS but negative OOS = likely overfit
+            score *= 0.3
+        # If IS is negative, score is already low, no extra penalty needed
+
+        # Bonus for strategies that actually work OOS
+        if val_sharpe > 0.5 and val_return > 0:
+            score += min(val_sharpe, 2.0) * 0.5  # OOS Sharpe bonus
 
     return score
 
@@ -775,7 +899,13 @@ def run_evolution(
 
         for i, strat in enumerate(population):
             metrics = backtest_strategy(strat, df_train, cache_train)
-            score = compute_fitness_score(metrics)
+
+            # Validate on OOS data if available (key anti-overfit mechanism)
+            val_metrics = None
+            if cache_val is not None and metrics["total_trades"] >= 5:
+                val_metrics = backtest_strategy(strat, df_val, cache_val)
+
+            score = compute_fitness_score(metrics, val_metrics)
 
             strat.fitness_score = score
             strat.fitness_sharpe = metrics["sharpe"]
