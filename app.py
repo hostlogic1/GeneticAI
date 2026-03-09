@@ -522,12 +522,13 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**Strategy Complexity**")
+    st.caption("How many indicator rules per strategy. More = stricter signals but fewer trades.")
     sc_col1, sc_col2 = st.columns(2)
-    min_entry = sc_col1.slider("Min Entry Conds", 1, 4, 2)
-    max_entry = sc_col2.slider("Max Entry Conds", 2, 6, 4)
+    min_entry = sc_col1.slider("Min Entry Indicators", 1, 4, 2)
+    max_entry = sc_col2.slider("Max Entry Indicators", 2, 6, 4)
     sc_col3, sc_col4 = st.columns(2)
-    min_exit = sc_col3.slider("Min Exit Conds", 1, 2, 1)
-    max_exit = sc_col4.slider("Max Exit Conds", 1, 3, 2)
+    min_exit = sc_col3.slider("Min Exit Indicators", 1, 2, 1)
+    max_exit = sc_col4.slider("Max Exit Indicators", 1, 3, 2)
     # Enforce min <= max
     max_entry = max(max_entry, min_entry)
     max_exit = max(max_exit, min_exit)
@@ -681,44 +682,144 @@ if st.session_state.running and st.session_state.train is not None:
 
 
 # ---------------------------------------------------------------------------
-# Run Walk-Forward
+# Run Walk-Forward (with live per-generation progress)
 # ---------------------------------------------------------------------------
 if st.session_state.running_wf and st.session_state.data is not None:
     st.markdown('<div class="section-header">Walk-Forward Analysis Progress</div>', unsafe_allow_html=True)
 
-    progress_bar_wf = st.progress(0)
-    status_text_wf = st.empty()
+    # Calculate folds first to show what's coming
+    from genetic_indicator_engine import generate_walk_forward_folds, IndicatorCache as IC
+    wf_folds = generate_walk_forward_folds(st.session_state.data, wf_train_months, wf_test_months)
+    n_total_folds = len(wf_folds)
 
-    def wf_progress_callback(fold_num, total_folds, fold_result):
-        progress_bar_wf.progress(fold_num / total_folds)
-        status_text_wf.markdown(
-            f"**Fold {fold_num}/{total_folds}** | "
-            f"OOS Return: {fold_result['oos_return']:+.2f}% | "
-            f"OOS Sharpe: {fold_result['oos_sharpe']:.3f} | "
-            f"Time: {fold_result['fold_time']:.1f}s"
-        )
+    if n_total_folds == 0:
+        st.error("Not enough data for the selected train/test window sizes. Try shorter windows.")
+        st.session_state.running_wf = False
+    else:
+        st.info(f"Running {n_total_folds} folds: {wf_train_months}mo train / {wf_test_months}mo test | "
+                f"{wf_pop} pop x {wf_gens} gens per fold")
 
-    wf_results = run_walk_forward(
-        df=st.session_state.data,
-        train_months=wf_train_months,
-        test_months=wf_test_months,
-        pop_size=wf_pop,
-        n_generations=wf_gens,
-        p_crossover=p_crossover,
-        p_mutation=p_mutation,
-        tournament_size=tournament_size,
-        elite_size=elite_size,
-        min_entry=min_entry,
-        max_entry=max_entry,
-        min_exit=min_exit,
-        max_exit=max_exit,
-        progress_callback=wf_progress_callback,
-    )
+        progress_bar_wf = st.progress(0)
+        status_text_wf = st.empty()
+        fold_status_text = st.empty()
 
-    st.session_state.wf_results = wf_results
-    st.session_state.running_wf = False
-    st.success(f"Walk-forward complete! {wf_results['n_folds']} folds in {wf_results['total_time']:.1f}s")
-    st.rerun()
+        # We'll run walk-forward manually so we can inject per-gen progress
+        import time as _time
+        wf_start_time = _time.time()
+        fold_results_list = []
+        oos_equity_segments = []
+
+        for fi, fold in enumerate(wf_folds):
+            fold_start_time = _time.time()
+
+            # Per-generation callback for THIS fold
+            def make_gen_callback(fold_idx, total_folds, gen_total):
+                def gen_cb(gen, total, stat):
+                    # Overall progress: (fold_idx * gens + gen) / (total_folds * gens)
+                    overall = (fold_idx * gen_total + gen) / (total_folds * gen_total)
+                    progress_bar_wf.progress(min(overall, 1.0))
+                    status_text_wf.markdown(
+                        f"**Fold {fold_idx+1}/{total_folds}** | Gen {gen}/{total} | "
+                        f"Best Score: {stat['best_score']:.3f} | "
+                        f"Sharpe: {stat['best_sharpe']:.3f} | "
+                        f"Return: {stat['best_return']:.1f}%"
+                    )
+                return gen_cb
+
+            gen_callback = make_gen_callback(fi, n_total_folds, wf_gens)
+
+            # Run GA on this fold's train data
+            fold_results = run_evolution(
+                df_train=fold["train_df"],
+                df_val=None,
+                pop_size=wf_pop,
+                n_generations=wf_gens,
+                p_crossover=p_crossover,
+                p_mutation=p_mutation,
+                tournament_size=tournament_size,
+                elite_size=elite_size,
+                progress_callback=gen_callback,
+                min_entry=min_entry,
+                max_entry=max_entry,
+                min_exit=min_exit,
+                max_exit=max_exit,
+            )
+
+            best = fold_results["best_strategy"]
+
+            # Evaluate on train (IS) and blind test (OOS)
+            cache_train = IC(fold["train_df"])
+            train_metrics = backtest_strategy(best, fold["train_df"], cache_train)
+            cache_test = IC(fold["test_df"])
+            test_metrics = backtest_strategy(best, fold["test_df"], cache_test)
+
+            fold_time = _time.time() - fold_start_time
+
+            if test_metrics["equity_curve"] is not None:
+                oos_equity_segments.append(test_metrics["equity_curve"])
+
+            entry_indicators = [c.indicator_name for c in best.entry_conditions]
+            exit_indicators = [c.indicator_name for c in best.exit_conditions]
+
+            fold_result_entry = {
+                "fold_num": fold["fold_num"],
+                "train_start": str(fold["train_start"]),
+                "train_end": str(fold["train_end"]),
+                "test_start": str(fold["test_start"]),
+                "test_end": str(fold["test_end"]),
+                "train_bars": len(fold["train_df"]),
+                "test_bars": len(fold["test_df"]),
+                "strategy": best,
+                "entry_indicators": entry_indicators,
+                "exit_indicators": exit_indicators,
+                "direction": best.direction,
+                "train_return": train_metrics["total_return"],
+                "train_sharpe": train_metrics["sharpe"],
+                "train_trades": train_metrics["total_trades"],
+                "oos_return": test_metrics["total_return"],
+                "oos_sharpe": test_metrics["sharpe"],
+                "oos_trades": test_metrics["total_trades"],
+                "oos_winrate": test_metrics["win_rate"],
+                "oos_max_dd": test_metrics["max_drawdown"],
+                "oos_profit_factor": test_metrics["profit_factor"],
+                "fold_time": fold_time,
+            }
+            fold_results_list.append(fold_result_entry)
+
+            fold_status_text.markdown(
+                f"Fold {fi+1} done: OOS Return **{test_metrics['total_return']:+.2f}%** | "
+                f"Sharpe **{test_metrics['sharpe']:.3f}** | Time: {fold_time:.1f}s"
+            )
+
+        # Stitch equity curves
+        from genetic_indicator_engine import _stitch_equity_curves
+        stitched = _stitch_equity_curves(oos_equity_segments)
+
+        oos_returns = [f["oos_return"] for f in fold_results_list]
+        oos_sharpes = [f["oos_sharpe"] for f in fold_results_list]
+        profitable_folds = sum(1 for r in oos_returns if r > 0)
+        total_wf_time = _time.time() - wf_start_time
+
+        wf_results = {
+            "folds": fold_results_list,
+            "n_folds": n_total_folds,
+            "stitched_equity": stitched,
+            "mean_oos_return": np.mean(oos_returns),
+            "median_oos_return": np.median(oos_returns),
+            "mean_oos_sharpe": np.mean(oos_sharpes),
+            "profitable_folds": profitable_folds,
+            "profitable_pct": profitable_folds / n_total_folds * 100,
+            "total_oos_return": sum(oos_returns),
+            "total_time": total_wf_time,
+            "train_months": wf_train_months,
+            "test_months": wf_test_months,
+        }
+
+        st.session_state.wf_results = wf_results
+        st.session_state.running_wf = False
+        st.success(f"Walk-forward complete! {n_total_folds} folds in {total_wf_time:.1f}s | "
+                   f"Profitable: {profitable_folds}/{n_total_folds}")
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
