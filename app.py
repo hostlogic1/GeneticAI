@@ -356,6 +356,73 @@ def create_trade_distribution_chart(trades_df):
     return fig
 
 
+def _update_live_wf_chart(placeholder, all_stats, total_folds, gens_per_fold):
+    """Render a live 2x2 chart grid during walk-forward: Score, Sharpe, Return, Profit Factor."""
+    if not all_stats:
+        return
+    df = pd.DataFrame(all_stats)
+
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=("Best Fitness Score", "Best Sharpe Ratio",
+                         "Best Return %", "Best Profit Factor"),
+        vertical_spacing=0.15, horizontal_spacing=0.08,
+    )
+
+    # Color each fold differently
+    fold_colors = ['#00bcd4', '#00e676', '#ffc107', '#ff5252', '#ab47bc',
+                   '#29b6f6', '#66bb6a', '#ffa726', '#ef5350', '#7e57c2',
+                   '#26c6da', '#9ccc65']
+
+    for fold_num in df["fold"].unique():
+        fold_df = df[df["fold"] == fold_num]
+        color = fold_colors[(fold_num - 1) % len(fold_colors)]
+        name = f"Fold {fold_num}"
+
+        fig.add_trace(go.Scatter(
+            x=fold_df["global_gen"], y=fold_df["best_score"],
+            mode='lines', name=name, line=dict(color=color, width=2),
+            showlegend=True,
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=fold_df["global_gen"], y=fold_df["best_sharpe"],
+            mode='lines', name=name, line=dict(color=color, width=2),
+            showlegend=False,
+        ), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=fold_df["global_gen"], y=fold_df["best_return"],
+            mode='lines', name=name, line=dict(color=color, width=2),
+            showlegend=False,
+        ), row=2, col=1)
+        fig.add_trace(go.Scatter(
+            x=fold_df["global_gen"], y=fold_df["best_pf"],
+            mode='lines', name=name, line=dict(color=color, width=2),
+            showlegend=False,
+        ), row=2, col=2)
+
+    # Add fold separator lines
+    for f in range(1, total_folds):
+        x_sep = f * gens_per_fold
+        for row in [1, 2]:
+            for col in [1, 2]:
+                fig.add_vline(x=x_sep, line_dash="dot", line_color="#333d55",
+                              line_width=1, row=row, col=col)
+
+    fig.update_layout(
+        paper_bgcolor='#0a0e17',
+        plot_bgcolor='#0a0e17',
+        font=dict(color='#8892a4', size=11),
+        height=500,
+        margin=dict(l=50, r=20, t=40, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
+                    font=dict(size=10)),
+    )
+    fig.update_xaxes(gridcolor='#1a2744', title_text="", showticklabels=True)
+    fig.update_yaxes(gridcolor='#1a2744')
+
+    placeholder.plotly_chart(fig, use_container_width=True)
+
+
 def create_walk_forward_fold_chart(fold_results, train_months, test_months):
     """Create horizontal bar chart showing train/test windows per fold (like the reference screenshots)."""
     fig = go.Figure()
@@ -642,6 +709,7 @@ if st.session_state.running and st.session_state.train is not None:
     gen_chart_placeholder = st.empty()
 
     gen_stats_live = []
+    all_gen_stats_evo = []
 
     def progress_callback(gen, total, stat):
         progress_bar.progress(gen / total)
@@ -650,13 +718,21 @@ if st.session_state.running and st.session_state.train is not None:
             f"Best Score: {stat['best_score']:.3f} | "
             f"Sharpe: {stat['best_sharpe']:.3f} | "
             f"Return: {stat['best_return']:.1f}% | "
+            f"PF: {stat['best_pf']:.2f} | "
+            f"WR: {stat['best_winrate']:.1f}% | "
+            f"DD: {stat['best_max_dd']:.1f}% | "
             f"Time: {stat['total_time']:.1f}s"
         )
         gen_stats_live.append(stat)
-        if gen % 3 == 0 or gen == total:
-            gen_chart_placeholder.plotly_chart(
-                create_generation_chart(gen_stats_live), use_container_width=True
-            )
+        all_gen_stats_evo.append({
+            "fold": 1, "gen": gen, "global_gen": gen,
+            "best_score": stat["best_score"], "best_sharpe": stat["best_sharpe"],
+            "best_return": stat["best_return"], "best_pf": stat["best_pf"],
+            "best_winrate": stat["best_winrate"], "best_max_dd": stat["best_max_dd"],
+            "avg_score": stat["avg_score"],
+        })
+        if gen % 2 == 0 or gen == total:
+            _update_live_wf_chart(gen_chart_placeholder, all_gen_stats_evo, 1, total)
 
     results = run_evolution(
         df_train=st.session_state.train,
@@ -701,6 +777,9 @@ if st.session_state.running_wf and st.session_state.data is not None:
 
         progress_bar_wf = st.progress(0)
         status_text_wf = st.empty()
+
+        # Live charts - 2x2 grid: Score+Sharpe (top), Return+PF (bottom)
+        live_chart_placeholder = st.empty()
         fold_status_text = st.empty()
 
         # We'll run walk-forward manually so we can inject per-gen progress
@@ -708,25 +787,44 @@ if st.session_state.running_wf and st.session_state.data is not None:
         wf_start_time = _time.time()
         fold_results_list = []
         oos_equity_segments = []
+        all_gen_stats_wf = []  # Track ALL generation stats across all folds
 
         for fi, fold in enumerate(wf_folds):
             fold_start_time = _time.time()
 
             # Per-generation callback for THIS fold
-            def make_gen_callback(fold_idx, total_folds, gen_total):
+            def make_gen_callback(fold_idx, total_folds, gen_total, all_stats):
                 def gen_cb(gen, total, stat):
-                    # Overall progress: (fold_idx * gens + gen) / (total_folds * gens)
+                    # Overall progress
                     overall = (fold_idx * gen_total + gen) / (total_folds * gen_total)
                     progress_bar_wf.progress(min(overall, 1.0))
                     status_text_wf.markdown(
                         f"**Fold {fold_idx+1}/{total_folds}** | Gen {gen}/{total} | "
                         f"Best Score: {stat['best_score']:.3f} | "
                         f"Sharpe: {stat['best_sharpe']:.3f} | "
-                        f"Return: {stat['best_return']:.1f}%"
+                        f"Return: {stat['best_return']:.1f}% | "
+                        f"PF: {stat['best_pf']:.2f} | "
+                        f"WR: {stat['best_winrate']:.1f}%"
                     )
+                    # Track for live chart
+                    all_stats.append({
+                        "fold": fold_idx + 1,
+                        "gen": gen,
+                        "global_gen": fold_idx * gen_total + gen,
+                        "best_score": stat["best_score"],
+                        "best_sharpe": stat["best_sharpe"],
+                        "best_return": stat["best_return"],
+                        "best_pf": stat["best_pf"],
+                        "best_winrate": stat["best_winrate"],
+                        "best_max_dd": stat["best_max_dd"],
+                        "avg_score": stat["avg_score"],
+                    })
+                    # Update live chart every 2 gens or on last gen
+                    if gen % 2 == 0 or gen == total:
+                        _update_live_wf_chart(live_chart_placeholder, all_stats, total_folds, gen_total)
                 return gen_cb
 
-            gen_callback = make_gen_callback(fi, n_total_folds, wf_gens)
+            gen_callback = make_gen_callback(fi, n_total_folds, wf_gens, all_gen_stats_wf)
 
             # Run GA on this fold's train data
             fold_results = run_evolution(
@@ -788,7 +886,11 @@ if st.session_state.running_wf and st.session_state.data is not None:
 
             fold_status_text.markdown(
                 f"Fold {fi+1} done: OOS Return **{test_metrics['total_return']:+.2f}%** | "
-                f"Sharpe **{test_metrics['sharpe']:.3f}** | Time: {fold_time:.1f}s"
+                f"Sharpe **{test_metrics['sharpe']:.3f}** | "
+                f"PF **{test_metrics['profit_factor']:.2f}** | "
+                f"WR **{test_metrics['win_rate']:.1f}%** | "
+                f"DD **{test_metrics['max_drawdown']:.1f}%** | "
+                f"Time: {fold_time:.1f}s"
             )
 
         # Stitch equity curves
