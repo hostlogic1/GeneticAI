@@ -260,24 +260,32 @@ def create_drawdown_chart(portfolio):
 
 
 def create_generation_chart(gen_stats):
-    """Create generation progress chart."""
+    """Create generation progress chart. Handles both normal and walk-forward formats."""
+    if not gen_stats:
+        return go.Figure()
     df = pd.DataFrame(gen_stats)
+    # Handle walk-forward format (uses global_gen) vs normal (uses generation)
+    x_col = "generation" if "generation" in df.columns else "global_gen"
+    if x_col not in df.columns:
+        x_col = "gen"
+
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
                         subplot_titles=("Best Fitness Score", "Best Sharpe Ratio"),
                         vertical_spacing=0.12)
     fig.add_trace(go.Scatter(
-        x=df["generation"], y=df["best_score"],
+        x=df[x_col], y=df["best_score"],
         mode='lines+markers', name='Best Score',
         line=dict(color='#00bcd4', width=2),
         marker=dict(size=6),
     ), row=1, col=1)
+    if "avg_score" in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df[x_col], y=df["avg_score"],
+            mode='lines', name='Avg Score',
+            line=dict(color='#8892a4', width=1, dash='dot'),
+        ), row=1, col=1)
     fig.add_trace(go.Scatter(
-        x=df["generation"], y=df["avg_score"],
-        mode='lines', name='Avg Score',
-        line=dict(color='#8892a4', width=1, dash='dot'),
-    ), row=1, col=1)
-    fig.add_trace(go.Scatter(
-        x=df["generation"], y=df["best_sharpe"],
+        x=df[x_col], y=df["best_sharpe"],
         mode='lines+markers', name='Best Sharpe',
         line=dict(color='#00e676', width=2),
         marker=dict(size=6),
@@ -919,6 +927,34 @@ if st.session_state.running_wf and st.session_state.data is not None:
 
         st.session_state.wf_results = wf_results
         st.session_state.running_wf = False
+
+        # Also populate st.session_state.results so the main display works
+        # Collect best strategies from all folds
+        wf_best_strategies = [f["strategy"] for f in fold_results_list if f["strategy"] is not None]
+        # Score them by OOS performance (not training!) for honest ranking
+        for fi_idx, f in enumerate(fold_results_list):
+            if f["strategy"] is not None:
+                f["strategy"].fitness_score = compute_fitness_score({
+                    "sharpe": f["oos_sharpe"], "sortino": 0.0,
+                    "total_return": f["oos_return"], "win_rate": f["oos_winrate"],
+                    "profit_factor": f["oos_profit_factor"],
+                    "max_drawdown": f["oos_max_dd"], "total_trades": f["oos_trades"],
+                })
+                f["strategy"].fitness_sharpe = f["oos_sharpe"]
+                f["strategy"].fitness_return = f["oos_return"]
+                f["strategy"].fitness_trades = f["oos_trades"]
+                f["strategy"].fitness_winrate = f["oos_winrate"]
+                f["strategy"].fitness_max_dd = f["oos_max_dd"]
+                f["strategy"].fitness_profit_factor = f["oos_profit_factor"]
+
+        st.session_state.results = {
+            "best_strategies": wf_best_strategies,
+            "best_strategy": wf_best_strategies[0] if wf_best_strategies else None,
+            "generation_stats": all_gen_stats_wf,
+            "all_evaluated": [],
+            "total_time": total_wf_time,
+        }
+
         st.success(f"Walk-forward complete! {n_total_folds} folds in {total_wf_time:.1f}s | "
                    f"Profitable: {profitable_folds}/{n_total_folds}")
         st.rerun()
