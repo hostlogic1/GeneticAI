@@ -834,10 +834,16 @@ if st.session_state.running_wf and st.session_state.data is not None:
 
             gen_callback = make_gen_callback(fi, n_total_folds, wf_gens, all_gen_stats_wf)
 
-            # Run GA on this fold's train data
+            # Split fold's train data: 80% sub-train, 20% sub-val for IS/OOS fitness penalty
+            fold_train_full = fold["train_df"]
+            split_idx = int(len(fold_train_full) * 0.8)
+            sub_train = fold_train_full.iloc[:split_idx]
+            sub_val = fold_train_full.iloc[split_idx:]
+
+            # Run GA with sub-validation to activate overfitting penalty
             fold_results = run_evolution(
-                df_train=fold["train_df"],
-                df_val=None,
+                df_train=sub_train,
+                df_val=sub_val,
                 pop_size=wf_pop,
                 n_generations=wf_gens,
                 p_crossover=p_crossover,
